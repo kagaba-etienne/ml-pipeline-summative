@@ -1,0 +1,115 @@
+<!-- Folder upload widget: browser -> API (presigned URLs) -> R2 directly.
+     __CONFIG__ is replaced by app.py with {"api": ..., "classes": [...], "maxFiles": ...}. -->
+<style>
+  /* light theme defaults; dark values are applied by applyTheme() below */
+  :root { --fg: #31333f; --border: rgba(49, 51, 63, 0.35); --code-bg: rgba(49, 51, 63, 0.08);
+          --err: #c0392b; --ok: #1e8449; }
+  :root.dark { --fg: #fafafa; --border: rgba(250, 250, 250, 0.45); --code-bg: rgba(250, 250, 250, 0.12);
+               --err: #ff8080; --ok: #5ce488; }
+  body { font-family: "Source Sans Pro", "Source Sans 3", sans-serif; font-size: 16px; margin: 0;
+         color: var(--fg); background: transparent; }
+  .box { border: 1px dashed var(--border); border-radius: 8px; padding: 16px; }
+  input[type=file] { color: var(--fg); font-size: 15px; margin-top: 12px; }
+  button { background: #ff4b4b; color: #fff; border: 0; border-radius: 6px; padding: 8px 18px;
+           font-size: 15px; font-weight: 600; cursor: pointer; margin-top: 12px; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  progress { width: 100%; margin-top: 12px; }
+  .err { color: var(--err); } .ok { color: var(--ok); font-weight: 600; }
+  ul { margin: 6px 0; padding-left: 20px; max-height: 140px; overflow-y: auto; }
+  code { background: var(--code-bg); color: var(--fg); padding: 1px 5px; border-radius: 4px; }
+</style>
+<div class="box">
+  <div>Pick a folder laid out as <code>my_batch/&lt;class&gt;/&lt;image&gt;</code> (.jpg, .jpeg, .png).</div>
+  <input id="picker" type="file" webkitdirectory multiple>
+  <div id="summary"></div>
+  <button id="go" disabled>Upload</button>
+  <progress id="bar" value="0" max="1" hidden></progress>
+  <div id="result"></div>
+</div>
+<script>
+const CFG = __CONFIG__;
+const TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"};
+const $ = id => document.getElementById(id);
+let files = [];
+
+// Follow the Streamlit theme: read the app's text colour (the iframe is same-origin).
+// Falls back to the OS setting. Re-checked every second so switching themes works.
+function applyTheme() {
+  let dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  try {
+    const app = window.parent.document.querySelector(".stApp") || window.parent.document.body;
+    const [r, g, b] = getComputedStyle(app).color.match(/\d+/g).map(Number);
+    dark = (r + g + b) / 3 > 128;            // light text => dark background
+  } catch (e) { /* not same-origin: keep the OS setting */ }
+  document.documentElement.classList.toggle("dark", dark);
+}
+applyTheme();
+setInterval(applyTheme, 1000);
+
+function ext(name) { const i = name.lastIndexOf("."); return i < 0 ? "" : name.slice(i).toLowerCase(); }
+
+// same rules as src/preprocessing.check_upload_paths (the API checks again)
+function check(list) {
+  const ok = [], errors = [];
+  for (const f of list) {
+    const parts = f.webkitRelativePath.split("/"), name = parts[parts.length - 1];
+    if (name.startsWith(".") || ["thumbs.db", "desktop.ini"].includes(name.toLowerCase())) continue;
+    if (parts.length !== 3) { errors.push(`${f.webkitRelativePath}: must be <folder>/<class>/<image>`); continue; }
+    if (!CFG.classes.includes(parts[1])) { errors.push(`${f.webkitRelativePath}: unknown class "${parts[1]}"`); continue; }
+    if (!TYPES[ext(name)]) { errors.push(`${f.webkitRelativePath}: only .jpg, .jpeg and .png are allowed`); continue; }
+    ok.push(f);
+  }
+  if (!ok.length && !errors.length) errors.push("no images found");
+  if (ok.length > CFG.maxFiles) errors.push(`${ok.length} images; at most ${CFG.maxFiles} per upload`);
+  return [ok, errors];
+}
+
+function list(items, cls) { return `<ul class="${cls}">` + items.map(e => `<li>${e.replace(/</g, "&lt;")}</li>`).join("") + "</ul>"; }
+
+$("picker").onchange = e => {
+  $("result").innerHTML = "";
+  const [ok, errors] = check([...e.target.files]);
+  files = errors.length ? [] : ok;
+  $("go").disabled = !files.length;
+  if (errors.length) { $("summary").innerHTML = `<p class="err">Fix the folder and pick it again:</p>` + list(errors, "err"); return; }
+  const counts = {};
+  ok.forEach(f => { const c = f.webkitRelativePath.split("/")[1]; counts[c] = (counts[c] || 0) + 1; });
+  $("summary").innerHTML = `<p>${ok.length} images in ${Object.keys(counts).length} classes:</p>` +
+    list(Object.entries(counts).map(([c, n]) => `${c}: ${n}`), "");
+};
+
+async function api(path, body) {
+  const r = await fetch(CFG.api + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await r.json();
+  if (!r.ok) throw new Error(Array.isArray(data.detail?.errors) ? data.detail.errors.join("\n") : JSON.stringify(data.detail));
+  return data;
+}
+
+$("go").onclick = async () => {
+  $("go").disabled = true; $("picker").disabled = true;
+  const bar = $("bar"); bar.hidden = false; bar.value = 0; bar.max = files.length;
+  try {
+    // 1. ask the API for one presigned URL per file
+    const byPath = new Map(files.map(f => [f.webkitRelativePath, f]));
+    const { files: targets } = await api("/uploads/presign", {
+      files: files.map(f => ({ relative_path: f.webkitRelativePath, content_type: TYPES[ext(f.name)] })) });
+    // 2. PUT each file straight to R2, 6 at a time
+    const queue = [...targets], done = [];
+    async function worker() {
+      for (let t; (t = queue.shift()); ) {
+        const r = await fetch(t.url, { method: "PUT", headers: { "Content-Type": t.content_type }, body: byPath.get(t.relative_path) });
+        if (r.ok) done.push(t.id);
+        bar.value++;
+      }
+    }
+    await Promise.all(Array.from({ length: 6 }, worker));
+    // 3. tell the API which files arrived
+    const res = await api("/uploads/complete", { ids: targets.map(t => t.id) });
+    $("result").innerHTML = `<p class="ok">Uploaded: ${res.pending} images ready for retraining` +
+      (res.rejected ? `, ${res.rejected} failed` : "") + `. Press "Refresh" below to update the counts.</p>`;
+  } catch (err) {
+    $("result").innerHTML = `<p class="err">Upload failed:</p>` + list(String(err.message).split("\n"), "err");
+  }
+  $("picker").disabled = false; $("picker").value = ""; files = []; bar.hidden = true;
+};
+</script>

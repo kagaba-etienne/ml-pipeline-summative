@@ -1,0 +1,54 @@
+# nginx (port 80) -> /api/* to the API containers (round robin), everything else to the UI.
+#
+#   docker compose up -d --build                # 1 API container
+#   docker compose up -d --scale api=4          # 4 API containers (no restart needed)
+#
+# Secrets are read from .env at runtime and given only to the API container.
+
+services:
+  api:
+    build: .
+    image: tomato-ml
+    command: ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000", "--root-path", "/api"]
+    environment:
+      DB_URL: ${DB_URL}
+      S3_URL: ${S3_URL}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      # each container gets API_CPUS cores (default 1) so 1 vs 2 vs 4 containers is a fair comparison
+      TF_NUM_INTRAOP_THREADS: ${API_CPUS:-1}
+      TF_NUM_INTEROP_THREADS: 1
+    deploy:
+      resources:
+        limits:
+          cpus: "${API_CPUS:-1}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+    restart: unless-stopped
+
+  ui:
+    build: .                        # same image as api (layers are cached, so it builds once)
+    image: tomato-ml
+    command: ["streamlit", "run", "ui/app.py", "--server.port", "8501", "--server.address", "0.0.0.0",
+              "--server.headless", "true", "--browser.gatherUsageStats", "false"]
+    environment:
+      API_URL: http://nginx/api     # Streamlit server -> API, through the load balancer
+      PUBLIC_API_URL: /api          # browser -> API (same origin, so no CORS needed)
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+      - ui
+    restart: unless-stopped

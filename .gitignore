@@ -1,0 +1,11 @@
+.venv
+.env
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# local cache of model versions downloaded from R2
+models/cache/
+
+# raw dataset archive (see README, "Data"); the extracted splits in data/ are kept
+data/raw/
