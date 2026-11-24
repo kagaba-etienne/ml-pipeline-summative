@@ -9,3 +9,6 @@ models/cache/
 
 # raw dataset archive (see README, "Data"); the extracted splits in data/ are kept
 data/raw/
+
+# demo upload folder (copied from data/validation, see README)
+new_data/
